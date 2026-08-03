@@ -1154,14 +1154,18 @@ impl PrecompiledArtifact {
         if let Some(key) = &self.cache_key {
             // SAFETY: Caller guarantees the pre-compiled bytes are trusted.
             #[allow(unsafe_code)]
-            return unsafe { PythonExecutor::from_precompiled_with_key(self.as_bytes(), key.clone()) };
+            return unsafe {
+                PythonExecutor::from_precompiled_with_key(self.as_bytes(), key.clone())
+            };
         }
         #[cfg(not(feature = "embedded"))]
         let _ = self.cache_key.as_ref();
 
         // SAFETY: Caller guarantees the pre-compiled bytes are trusted.
         #[allow(unsafe_code)]
-        unsafe { PythonExecutor::from_precompiled(self.as_bytes()) }
+        unsafe {
+            PythonExecutor::from_precompiled(self.as_bytes())
+        }
     }
 }
 

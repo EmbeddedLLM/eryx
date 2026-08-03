@@ -383,6 +383,21 @@ class TestSandboxFactoryWithCallbacks:
         result = sandbox.execute("d = await get_data(); print(d['data'])")
         assert "from_factory" in result.stdout
 
+    def test_factory_session_honors_callback_limit(self, sandbox_factory):
+        """Factory sessions apply callback limits supplied by the caller."""
+
+        def get_data():
+            return {"data": "unexpected"}
+
+        limits = eryx.ResourceLimits(max_callback_invocations=0)
+        session = sandbox_factory.create_session(
+            resource_limits=limits,
+            callbacks=[{"name": "get_data", "fn": get_data, "description": ""}],
+        )
+
+        with pytest.raises(eryx.ExecutionError, match="Callback limit exceeded"):
+            session.execute("result = await get_data()")
+
 
 class TestSessionWithCallbacks:
     """Tests for Session with callbacks."""

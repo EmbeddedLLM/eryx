@@ -333,6 +333,60 @@ class TestSandboxFactory:
         result = sandbox.execute("print('hello')")
         assert result.stdout == "hello"
 
+    def test_factory_create_session(self, sandbox_factory):
+        """Factory sessions preserve pre-imports and clear user globals."""
+        session = sandbox_factory.create_session()
+
+        preimported = session.execute(
+            "import sys; result = 'json' in sys.modules"
+        )
+        assert preimported.result is True
+
+        session.execute("user_value = 42")
+        session.clear_state()
+        cleared = session.execute("result = 'user_value' not in globals()")
+        assert cleared.result is True
+
+    def test_factory_session_custom_result_variable(self, sandbox_factory):
+        """Factory sessions support a custom result variable."""
+        session = sandbox_factory.create_session(result_variable="answer")
+        result = session.execute("answer = {'value': 42}")
+        assert result.result == {"value": 42}
+
+    def test_factory_session_output_handlers(self, sandbox_factory):
+        """Factory sessions stream stdout and stderr through their handlers."""
+        stdout: list[str] = []
+        stderr: list[str] = []
+        session = sandbox_factory.create_session(
+            on_stdout=stdout.append,
+            on_stderr=stderr.append,
+        )
+
+        session.execute("import sys; print('out'); print('err', file=sys.stderr)")
+
+        assert "out" in "".join(stdout)
+        assert "err" in "".join(stderr)
+
+    def test_cached_factory_create_session(self, sandbox_factory, tmp_path):
+        """Saved cached factories create independent live sessions."""
+        save_path = tmp_path / "cached-session-factory.bin"
+        sandbox_factory.save(save_path)
+        cached_factory = eryx.SandboxFactory.load(save_path, cache=True)
+
+        first = cached_factory.create_session()
+        first.execute("session_value = 42")
+
+        second = cached_factory.create_session()
+        result = second.execute("result = 'session_value' not in globals()")
+        assert result.result is True
+
+    def test_factory_session_memory_limit(self, sandbox_factory):
+        """Factory sessions enforce memory limits during instantiation."""
+        limits = eryx.ResourceLimits(max_memory_bytes=1)
+
+        with pytest.raises(eryx.InitializationError):
+            sandbox_factory.create_session(resource_limits=limits)
+
     def test_factory_multiple_sandboxes(self, sandbox_factory):
         """Test creating multiple sandboxes from same factory."""
         sandbox1 = sandbox_factory.create_sandbox()

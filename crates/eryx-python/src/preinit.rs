@@ -363,7 +363,7 @@ impl SandboxFactory {
     ///
     /// Args:
     ///     resource_limits: Optional ResourceLimits applying execution timeout,
-    ///         fuel, and maximum memory limits.
+    ///         callback, fuel, and maximum memory limits.
     ///     network: Optional network configuration.
     ///     callbacks: Optional callbacks that sandboxed code can invoke.
     ///         Can be a CallbackRegistry or a list of callback dicts.
@@ -420,20 +420,20 @@ impl SandboxFactory {
         }
         let executor = Arc::new(executor);
 
-        let (execution_timeout_ms, max_fuel, max_memory_bytes) = match &resource_limits {
-            Some(limits) => (
-                limits.execution_timeout_ms,
-                limits.max_fuel,
-                limits.max_memory_bytes,
-            ),
-            None => (None, None, None),
-        };
+        let resource_limits = resource_limits.as_ref().map_or_else(
+            || eryx::ResourceLimits {
+                execution_timeout: None,
+                max_memory_bytes: None,
+                max_fuel: None,
+                ..eryx::ResourceLimits::default()
+            },
+            Into::into,
+        );
 
         Session::from_executor(
             py,
             executor,
-            execution_timeout_ms,
-            max_fuel,
+            resource_limits,
             None, // No VfsStorage - volumes below trigger an auto-created one
             None, // Default VFS mount path (/data)
             network,
@@ -442,7 +442,6 @@ impl SandboxFactory {
             volumes,
             on_stdout,
             on_stderr,
-            max_memory_bytes,
         )
     }
 

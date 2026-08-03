@@ -15,12 +15,15 @@ use std::sync::{Arc, LazyLock};
 
 use eryx::callback_handler::run_callback_handler;
 use eryx::secrets::SecretConfig;
-use eryx::{Callback, CallbackError, PythonExecutor, ResourceLimits, SessionExecutor, TypedCallback};
+use eryx::{
+    Callback, CallbackError, PythonExecutor, ResourceLimits, SessionExecutor, TypedCallback,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 /// Shared executor to avoid repeated WASM loading across tests.
-static SHARED_EXECUTOR: LazyLock<Arc<PythonExecutor>> = LazyLock::new(|| Arc::new(create_executor()));
+static SHARED_EXECUTOR: LazyLock<Arc<PythonExecutor>> =
+    LazyLock::new(|| Arc::new(create_executor()));
 
 fn get_shared_executor() -> Arc<PythonExecutor> {
     SHARED_EXECUTOR.clone()

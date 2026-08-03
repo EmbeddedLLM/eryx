@@ -218,3 +218,13 @@ class TestSandboxFactoryVolumes:
         )
         result = sandbox.execute('print(open("/mnt/data/factory.txt").read())')
         assert "from factory sandbox" in result.stdout
+
+    def test_factory_session_with_volumes(self, sandbox_factory, tmp_path):
+        """Factory-created sessions support persistent volume mounts."""
+        (tmp_path / "factory-session.txt").write_text("from factory session")
+        session = sandbox_factory.create_session(
+            volumes=[(str(tmp_path), "/mnt/data", True)],
+        )
+
+        result = session.execute('print(open("/mnt/data/factory-session.txt").read())')
+        assert "from factory session" in result.stdout

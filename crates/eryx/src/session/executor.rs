@@ -739,7 +739,14 @@ impl SessionExecutor {
         vfs_storage: eryx_vfs::ArcStorage,
         vfs_config: VfsConfig,
     ) -> Result<Self, Error> {
-        Self::new_internal(executor, callbacks, Some(vfs_storage), Some(vfs_config), None).await
+        Self::new_internal(
+            executor,
+            callbacks,
+            Some(vfs_storage),
+            Some(vfs_config),
+            None,
+        )
+        .await
     }
 
     /// Create a new session executor with custom VFS storage, configuration, and

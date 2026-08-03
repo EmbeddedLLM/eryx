@@ -69,6 +69,8 @@ pub struct Session {
     net_config: Option<eryx::NetConfig>,
     /// Output handler for streaming stdout/stderr.
     output_handler: Option<Arc<dyn OutputHandler>>,
+    /// Resource limits applied to executions and callback handling.
+    resource_limits: eryx::ResourceLimits,
 }
 
 impl Session {
@@ -84,8 +86,7 @@ impl Session {
     pub(crate) fn from_executor(
         py: Python<'_>,
         executor: Arc<eryx::PythonExecutor>,
-        execution_timeout_ms: Option<u64>,
-        max_fuel: Option<u64>,
+        resource_limits: eryx::ResourceLimits,
         vfs: Option<VfsStorage>,
         vfs_mount_path: Option<String>,
         network: Option<NetConfig>,
@@ -94,7 +95,6 @@ impl Session {
         volumes: Option<Vec<(String, String, bool)>>,
         on_stdout: Option<Py<PyAny>>,
         on_stderr: Option<Py<PyAny>>,
-        memory_limit_bytes: Option<u64>,
     ) -> PyResult<Self> {
         // Create a tokio runtime for async execution
         let runtime = Arc::new(
@@ -175,7 +175,7 @@ impl Session {
                         &callbacks_vec,
                         storage.clone(),
                         config,
-                        memory_limit_bytes,
+                        resource_limits.max_memory_bytes,
                     )
                     .await?;
                     Ok((session, Some(storage)))
@@ -183,7 +183,7 @@ impl Session {
                     let session = eryx::SessionExecutor::new_with_limits(
                         Arc::clone(&executor),
                         &callbacks_vec,
-                        memory_limit_bytes,
+                        resource_limits.max_memory_bytes,
                     )
                     .await?;
                     Ok((session, None))
@@ -204,7 +204,11 @@ impl Session {
 
         let net_config: Option<eryx::NetConfig> = network.map(Into::into);
 
-        let session = Self {
+        let mut inner = inner;
+        inner.set_execution_timeout(resource_limits.execution_timeout);
+        inner.set_fuel_limit(resource_limits.max_fuel);
+
+        Ok(Self {
             inner: Mutex::new(Some(inner)),
             executor,
             runtime,
@@ -213,19 +217,8 @@ impl Session {
             callbacks: callbacks_map,
             net_config,
             output_handler,
-        };
-
-        // Set execution timeout if provided
-        if let Some(timeout_ms) = execution_timeout_ms {
-            session.set_execution_timeout_ms(Some(timeout_ms))?;
-        }
-
-        // Set fuel limit if provided
-        if max_fuel.is_some() {
-            session.set_fuel_limit(max_fuel)?;
-        }
-
-        Ok(session)
+            resource_limits,
+        })
     }
 }
 
@@ -294,11 +287,17 @@ impl Session {
         }
         let executor = Arc::new(executor);
 
+        let resource_limits = eryx::ResourceLimits {
+            execution_timeout: execution_timeout_ms.map(Duration::from_millis),
+            max_memory_bytes: None,
+            max_fuel,
+            ..eryx::ResourceLimits::default()
+        };
+
         Self::from_executor(
             py,
             executor,
-            execution_timeout_ms,
-            max_fuel,
+            resource_limits,
             vfs,
             vfs_mount_path,
             network,
@@ -307,7 +306,6 @@ impl Session {
             volumes,
             on_stdout,
             on_stderr,
-            None, // Embedded sessions keep the historical no-memory-limit behavior
         )
     }
 
@@ -338,6 +336,7 @@ impl Session {
         let callbacks_map = self.callbacks.clone();
         let output_handler = self.output_handler.clone();
         let net_config = self.net_config.clone();
+        let resource_limits = self.resource_limits.clone();
 
         // Release the GIL while executing
         py.detach(|| {
@@ -364,7 +363,7 @@ impl Session {
                         eryx::callback_handler::run_callback_handler(
                             callback_rx,
                             handler_callbacks,
-                            eryx::ResourceLimits::default(),
+                            resource_limits,
                             std::sync::Arc::new(std::collections::HashMap::new()),
                         )
                         .await

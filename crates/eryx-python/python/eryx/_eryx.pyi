@@ -784,7 +784,7 @@ class SandboxFactory:
 
         Args:
             resource_limits: Optional resource limits applying execution timeout,
-                fuel, and maximum memory limits.
+                callback, fuel, and maximum memory limits.
             network: Optional network configuration. If provided, enables networking.
             callbacks: Optional callbacks that sandboxed code can invoke.
                 Can be a CallbackRegistry or a list of callback dicts.

@@ -220,7 +220,7 @@ def sandbox_factory():
     """
     global _shared_factory
     if _shared_factory is None:
-        _shared_factory = eryx.SandboxFactory()
+        _shared_factory = eryx.SandboxFactory(imports=["json"])
     return _shared_factory
 
 

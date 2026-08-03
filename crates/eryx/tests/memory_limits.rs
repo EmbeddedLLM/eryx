@@ -10,7 +10,8 @@ use std::sync::{Arc, LazyLock};
 use eryx::{Error, PythonExecutor, SessionExecutor};
 
 /// Shared executor to avoid repeated WASM loading across tests.
-static SHARED_EXECUTOR: LazyLock<Arc<PythonExecutor>> = LazyLock::new(|| Arc::new(create_executor()));
+static SHARED_EXECUTOR: LazyLock<Arc<PythonExecutor>> =
+    LazyLock::new(|| Arc::new(create_executor()));
 
 fn get_shared_executor() -> Arc<PythonExecutor> {
     SHARED_EXECUTOR.clone()
@@ -143,10 +144,7 @@ async fn test_memory_limit_preserved_across_reset() {
     );
 
     // reset() re-instantiates the component; the limit must be preserved.
-    session
-        .reset(&[])
-        .await
-        .expect("Reset should succeed");
+    session.reset(&[]).await.expect("Reset should succeed");
     assert!(
         session.execute(ALLOC_CODE).run().await.is_err(),
         "The memory limit must be enforced after reset()"
