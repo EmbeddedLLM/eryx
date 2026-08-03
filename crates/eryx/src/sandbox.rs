@@ -1133,6 +1133,36 @@ impl PrecompiledArtifact {
     fn cache_key(&self) -> Option<&crate::cache::CacheKey> {
         self.cache_key.as_ref()
     }
+
+    /// Build a `PythonExecutor` from this artifact, consulting the process-global
+    /// [`crate::cache::InstancePreCache`] when this artifact carries a cache key.
+    ///
+    /// On a cache hit this skips re-deserializing the (potentially hundreds of
+    /// MB) component bytes entirely — the same fast path the sandbox builder
+    /// uses for cached artifacts. Without a cache key (or without the `embedded`
+    /// feature) it falls back to a plain deserialize.
+    ///
+    /// # Safety
+    ///
+    /// Pre-compiled bytes cannot be fully validated by Wasmtime. Only construct
+    /// executors from artifacts created by [`PythonExecutor::precompile`] from
+    /// trusted components.
+    #[cfg(any(feature = "embedded", feature = "preinit"))]
+    #[allow(unsafe_code)]
+    pub unsafe fn to_executor(&self) -> std::result::Result<PythonExecutor, Error> {
+        #[cfg(feature = "embedded")]
+        if let Some(key) = &self.cache_key {
+            // SAFETY: Caller guarantees the pre-compiled bytes are trusted.
+            #[allow(unsafe_code)]
+            return unsafe { PythonExecutor::from_precompiled_with_key(self.as_bytes(), key.clone()) };
+        }
+        #[cfg(not(feature = "embedded"))]
+        let _ = self.cache_key.as_ref();
+
+        // SAFETY: Caller guarantees the pre-compiled bytes are trusted.
+        #[allow(unsafe_code)]
+        unsafe { PythonExecutor::from_precompiled(self.as_bytes()) }
+    }
 }
 
 #[cfg(any(feature = "embedded", feature = "preinit"))]

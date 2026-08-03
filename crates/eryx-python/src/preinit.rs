@@ -400,10 +400,14 @@ impl SandboxFactory {
     ) -> PyResult<Session> {
         // Build a PythonExecutor from the factory's pre-compiled artifact,
         // preserving the stdlib/site-packages mounts and pre-imported snapshot.
+        // to_executor() consults the process-global InstancePreCache when the
+        // artifact carries a cache key (factory loaded with cache=True), so a
+        // warm cache turns session creation into ~0ms instead of re-deserializing
+        // the component bytes.
         let mut executor = unsafe {
             // SAFETY: the precompiled bytes were created by PythonExecutor::precompile()
             // from a trusted pre-initialized component (see SandboxFactory::new).
-            eryx::PythonExecutor::from_precompiled(self.precompiled.as_bytes()).map_err(|e| {
+            self.precompiled.to_executor().map_err(|e| {
                 InitializationError::new_err(format!("failed to create executor: {e}"))
             })?
         };
