@@ -459,6 +459,21 @@ pub struct SessionExecutor {
     /// Optional fuel limit for instruction tracking/limiting.
     fuel_limit: Option<u64>,
 
+    /// Memory limit (bytes) enforced by the memory tracker. Preserved across
+    /// full resets so re-instantiated sessions keep the same limit.
+    memory_limit: Option<u64>,
+
+    /// Whether this session may take the empty-callback fast path.
+    ///
+    /// A freshly instantiated session is eligible while its callback set has
+    /// always been empty: the pre-initialized empty-callback infrastructure
+    /// can be reused without re-running `setup_callbacks`. Once any non-empty
+    /// callback set is installed, the optimization is disabled for this
+    /// instance, because stale callback wrappers could otherwise survive into
+    /// later (empty) executions. A full `reset()` creates a clean instance and
+    /// restores eligibility.
+    callbacks_reuse_allowed: bool,
+
     /// VFS storage that persists across resets.
     #[cfg(feature = "vfs")]
     vfs_storage: Option<eryx_vfs::ArcStorage>,
@@ -625,11 +640,40 @@ impl SessionExecutor {
     ) -> Result<Self, Error> {
         #[cfg(feature = "vfs")]
         {
-            Self::new_internal(executor, callbacks, None, None).await
+            Self::new_internal(executor, callbacks, None, None, None).await
         }
         #[cfg(not(feature = "vfs"))]
         {
-            Self::new_internal(executor, callbacks).await
+            Self::new_internal(executor, callbacks, None).await
+        }
+    }
+
+    /// Create a new session executor from a `PythonExecutor` with a memory limit.
+    ///
+    /// The limit is enforced by the WASM memory tracker and preserved across
+    /// full `reset()` calls (which re-instantiate the component).
+    ///
+    /// # Arguments
+    ///
+    /// * `executor` - The parent executor providing engine and instance_pre
+    /// * `callbacks` - Callbacks available for this session
+    /// * `memory_limit` - Maximum WASM memory in bytes, or `None` for no limit
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WASM component cannot be instantiated.
+    pub async fn new_with_limits(
+        executor: Arc<PythonExecutor>,
+        callbacks: &[Arc<dyn Callback>],
+        memory_limit: Option<u64>,
+    ) -> Result<Self, Error> {
+        #[cfg(feature = "vfs")]
+        {
+            Self::new_internal(executor, callbacks, None, None, memory_limit).await
+        }
+        #[cfg(not(feature = "vfs"))]
+        {
+            Self::new_internal(executor, callbacks, memory_limit).await
         }
     }
 
@@ -654,7 +698,7 @@ impl SessionExecutor {
         callbacks: &[Arc<dyn Callback>],
         vfs_storage: eryx_vfs::ArcStorage,
     ) -> Result<Self, Error> {
-        Self::new_internal(executor, callbacks, Some(vfs_storage), None).await
+        Self::new_internal(executor, callbacks, Some(vfs_storage), None, None).await
     }
 
     /// Create a new session executor with custom VFS storage and configuration.
@@ -695,7 +739,42 @@ impl SessionExecutor {
         vfs_storage: eryx_vfs::ArcStorage,
         vfs_config: VfsConfig,
     ) -> Result<Self, Error> {
-        Self::new_internal(executor, callbacks, Some(vfs_storage), Some(vfs_config)).await
+        Self::new_internal(executor, callbacks, Some(vfs_storage), Some(vfs_config), None).await
+    }
+
+    /// Create a new session executor with custom VFS storage, configuration, and
+    /// a memory limit.
+    ///
+    /// The memory limit is enforced by the WASM memory tracker and preserved
+    /// across full `reset()` calls.
+    ///
+    /// # Arguments
+    ///
+    /// * `executor` - The parent executor providing engine and instance_pre
+    /// * `callbacks` - Callbacks available for this session
+    /// * `vfs_storage` - The VFS storage to use
+    /// * `vfs_config` - Configuration for the VFS mount (path, permissions)
+    /// * `memory_limit` - Maximum WASM memory in bytes, or `None` for no limit
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WASM component cannot be instantiated.
+    #[cfg(feature = "vfs")]
+    pub async fn new_with_vfs_config_and_limits(
+        executor: Arc<PythonExecutor>,
+        callbacks: &[Arc<dyn Callback>],
+        vfs_storage: eryx_vfs::ArcStorage,
+        vfs_config: VfsConfig,
+        memory_limit: Option<u64>,
+    ) -> Result<Self, Error> {
+        Self::new_internal(
+            executor,
+            callbacks,
+            Some(vfs_storage),
+            Some(vfs_config),
+            memory_limit,
+        )
+        .await
     }
 
     /// Internal constructor with optional VFS storage and config.
@@ -705,6 +784,7 @@ impl SessionExecutor {
         callbacks: &[Arc<dyn Callback>],
         vfs_storage: Option<eryx_vfs::ArcStorage>,
         vfs_config: Option<VfsConfig>,
+        memory_limit: Option<u64>,
     ) -> Result<Self, Error> {
         let callback_infos = build_callback_infos(callbacks);
         let wasi = build_wasi_context(&executor)?;
@@ -727,7 +807,7 @@ impl SessionExecutor {
             None,
             None,
             callback_infos,
-            MemoryTracker::new(None),
+            MemoryTracker::new(memory_limit),
             hybrid_vfs_ctx,
         );
 
@@ -775,6 +855,8 @@ impl SessionExecutor {
             execution_count: 0,
             execution_timeout: None,
             fuel_limit: None,
+            memory_limit,
+            callbacks_reuse_allowed: callbacks.is_empty(),
             vfs_storage: Some(vfs_storage),
             vfs_config: Some(vfs_config),
         })
@@ -785,6 +867,7 @@ impl SessionExecutor {
     async fn new_internal(
         executor: Arc<PythonExecutor>,
         callbacks: &[Arc<dyn Callback>],
+        memory_limit: Option<u64>,
     ) -> Result<Self, Error> {
         let callback_infos = build_callback_infos(callbacks);
         let wasi = build_wasi_context(&executor)?;
@@ -795,7 +878,7 @@ impl SessionExecutor {
             None,
             None,
             callback_infos,
-            MemoryTracker::new(None),
+            MemoryTracker::new(memory_limit),
         );
 
         // Create store
@@ -840,6 +923,8 @@ impl SessionExecutor {
             execution_count: 0,
             execution_timeout: None,
             fuel_limit: None,
+            memory_limit,
+            callbacks_reuse_allowed: callbacks.is_empty(),
         })
     }
 
@@ -988,6 +1073,11 @@ impl SessionExecutor {
             state.set_output_tx(output_tx);
             state.set_callbacks(callback_infos);
             state.reset_memory_tracker();
+            // The empty-callback fast path is only safe while the session has
+            // never installed a non-empty callback set: skipping setup on an
+            // empty execution would leave stale callback wrappers from an
+            // earlier execution reachable.
+            state.reuse_empty_callbacks = self.callbacks_reuse_allowed && callbacks.is_empty();
             // A reused store keeps its ExecutorState across runs; clear any stale
             // suspension flag so it does not misclassify this run's trap.
             state.clear_suspended();
@@ -1077,6 +1167,13 @@ impl SessionExecutor {
         // Stop the epoch ticker thread if it was running
         if let Some(stop_flag) = epoch_ticker {
             stop_flag.store(true, Ordering::Relaxed);
+        }
+
+        // A non-empty callback set was installed in this execution, so the
+        // empty-callback fast path is disabled for this instance: stale
+        // callback wrappers could otherwise survive into later executions.
+        if !callbacks.is_empty() {
+            self.callbacks_reuse_allowed = false;
         }
 
         // Clear channels after execution and capture peak memory
@@ -1191,7 +1288,7 @@ impl SessionExecutor {
             None,
             None,
             callback_infos,
-            MemoryTracker::new(None),
+            MemoryTracker::new(self.memory_limit),
         );
 
         #[cfg(feature = "vfs")]
@@ -1208,7 +1305,7 @@ impl SessionExecutor {
                 None,
                 None,
                 callback_infos,
-                MemoryTracker::new(None),
+                MemoryTracker::new(self.memory_limit),
                 Some(build_hybrid_vfs_context(
                     &self.executor,
                     vfs_storage,
@@ -1263,6 +1360,9 @@ impl SessionExecutor {
         self.execution_count = 0;
         self.execution_timeout = execution_timeout;
         self.fuel_limit = fuel_limit;
+        // The fresh instance starts with the pre-initialized empty-callback
+        // infrastructure, so the fast path is eligible again.
+        self.callbacks_reuse_allowed = true;
 
         Ok(())
     }

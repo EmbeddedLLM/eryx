@@ -4,6 +4,7 @@
 //! The factory bundles packages and pre-imports into a reusable snapshot.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -13,6 +14,7 @@ use crate::error::{InitializationError, eryx_error_to_py};
 use crate::net_config::NetConfig;
 use crate::resource_limits::ResourceLimits;
 use crate::sandbox::{PyOutputHandler, Sandbox, apply_secrets};
+use crate::session::Session;
 
 /// A factory for creating sandboxes with custom packages.
 ///
@@ -346,6 +348,98 @@ impl SandboxFactory {
         let inner = builder.build().map_err(eryx_error_to_py)?;
 
         Sandbox::from_inner(inner)
+    }
+
+    /// Create a new session backed by this factory's pre-initialized runtime.
+    ///
+    /// Unlike `create_sandbox()`, the returned `Session` keeps one WASM instance
+    /// alive and reuses it across `execute()` calls: the factory's packages and
+    /// pre-imports stay warm through `sys.modules`, while per-call
+    /// `clear_state()` resets the user namespace. This gives ~3-5ms per-call
+    /// execution (vs ~10-20ms for `create_sandbox`) at the cost of weaker
+    /// isolation: module-level state (builtins mutations, `os.environ`, native
+    /// extension state) persists across executions. This is globals-cleared
+    /// interpreter reuse, not fresh-interpreter isolation.
+    ///
+    /// Args:
+    ///     resource_limits: Optional ResourceLimits applying execution timeout,
+    ///         fuel, and maximum memory limits.
+    ///     network: Optional network configuration.
+    ///     callbacks: Optional callbacks that sandboxed code can invoke.
+    ///         Can be a CallbackRegistry or a list of callback dicts.
+    ///     volumes: Optional list of (host_path, guest_path, read_only) tuples
+    ///         mounting host paths into the session.
+    ///     on_stdout: Optional streaming callback for stdout output.
+    ///     on_stderr: Optional streaming callback for stderr output.
+    ///     result_variable: Optional name of the variable captured as the
+    ///         structured result (default "result").
+    ///
+    /// Returns:
+    ///     A Session reusing this factory's runtime.
+    ///
+    /// Raises:
+    ///     InitializationError: If the session fails to initialize.
+    ///
+    /// Example:
+    ///     factory = SandboxFactory(imports=["numpy"])
+    ///     session = factory.create_session()
+    ///     session.execute('import numpy as np; result = np.arange(5).sum()')
+    ///     print(session.execute('print(np.arange(5).sum())').stdout)  # "10"
+    #[pyo3(signature = (*, resource_limits=None, network=None, callbacks=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn create_session(
+        &self,
+        py: Python<'_>,
+        resource_limits: Option<ResourceLimits>,
+        network: Option<NetConfig>,
+        callbacks: Option<Bound<'_, PyAny>>,
+        volumes: Option<Vec<(String, String, bool)>>,
+        on_stdout: Option<Py<PyAny>>,
+        on_stderr: Option<Py<PyAny>>,
+        result_variable: Option<String>,
+    ) -> PyResult<Session> {
+        // Build a PythonExecutor from the factory's pre-compiled artifact,
+        // preserving the stdlib/site-packages mounts and pre-imported snapshot.
+        let mut executor = unsafe {
+            // SAFETY: the precompiled bytes were created by PythonExecutor::precompile()
+            // from a trusted pre-initialized component (see SandboxFactory::new).
+            eryx::PythonExecutor::from_precompiled(self.precompiled.as_bytes()).map_err(|e| {
+                InitializationError::new_err(format!("failed to create executor: {e}"))
+            })?
+        };
+        executor = executor.with_python_stdlib(&self.stdlib_path);
+        if let Some(path) = &self.site_packages_path {
+            executor = executor.with_site_packages(path);
+        }
+        if let Some(name) = result_variable {
+            executor = executor.with_result_variable(name);
+        }
+        let executor = Arc::new(executor);
+
+        let (execution_timeout_ms, max_fuel, max_memory_bytes) = match &resource_limits {
+            Some(limits) => (
+                limits.execution_timeout_ms,
+                limits.max_fuel,
+                limits.max_memory_bytes,
+            ),
+            None => (None, None, None),
+        };
+
+        Session::from_executor(
+            py,
+            executor,
+            execution_timeout_ms,
+            max_fuel,
+            None, // No VfsStorage - volumes below trigger an auto-created one
+            None, // Default VFS mount path (/data)
+            network,
+            callbacks,
+            None, // No MCP manager on the factory path
+            volumes,
+            on_stdout,
+            on_stderr,
+            max_memory_bytes,
+        )
     }
 
     /// Get the size of the pre-compiled runtime in bytes.

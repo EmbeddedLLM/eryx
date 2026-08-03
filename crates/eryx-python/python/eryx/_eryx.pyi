@@ -760,6 +760,55 @@ class SandboxFactory:
         """
         ...
 
+    def create_session(
+        self,
+        *,
+        resource_limits: Optional[ResourceLimits] = None,
+        network: Optional[NetConfig] = None,
+        callbacks: Optional[Union[CallbackRegistry, Sequence[CallbackDict]]] = None,
+        volumes: Optional[Sequence[tuple[str, str, bool]]] = None,
+        on_stdout: Optional[Callable[[str], None]] = None,
+        on_stderr: Optional[Callable[[str], None]] = None,
+        result_variable: Optional[str] = None,
+    ) -> Session:
+        """Create a new session backed by this factory's pre-initialized runtime.
+
+        Unlike `create_sandbox()`, the returned `Session` keeps one WASM instance
+        alive and reuses it across `execute()` calls: the factory's packages and
+        pre-imports stay warm through `sys.modules`, while per-call
+        `clear_state()` resets the user namespace. This gives ~3-5ms per-call
+        execution (vs ~10-20ms for `create_sandbox`) at the cost of weaker
+        isolation: module-level state (builtins mutations, `os.environ`, native
+        extension state) persists across executions. This is globals-cleared
+        interpreter reuse, not fresh-interpreter isolation.
+
+        Args:
+            resource_limits: Optional resource limits applying execution timeout,
+                fuel, and maximum memory limits.
+            network: Optional network configuration. If provided, enables networking.
+            callbacks: Optional callbacks that sandboxed code can invoke.
+                Can be a CallbackRegistry or a list of callback dicts.
+            volumes: Optional list of (host_path, guest_path, read_only) tuples
+                mounting host paths into the session.
+            on_stdout: Optional streaming callback for stdout output.
+            on_stderr: Optional streaming callback for stderr output.
+            result_variable: Optional name of the variable captured as the
+                structured result (default "result").
+
+        Returns:
+            A Session reusing this factory's runtime.
+
+        Raises:
+            InitializationError: If session creation fails.
+
+        Example:
+            factory = SandboxFactory(imports=["numpy"])
+            session = factory.create_session()
+            session.execute('import numpy as np; result = np.arange(5).sum()')
+            print(session.execute('print(np.arange(5).sum())').stdout)  # "10"
+        """
+        ...
+
     def to_bytes(self) -> bytes:
         """Get the pre-compiled runtime as bytes.
 

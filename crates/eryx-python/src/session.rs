@@ -71,62 +71,30 @@ pub struct Session {
     output_handler: Option<Arc<dyn OutputHandler>>,
 }
 
-#[pymethods]
 impl Session {
-    /// Create a new session with the embedded Python runtime.
+    /// Shared constructor: builds the session machinery around an already-created
+    /// [`eryx::PythonExecutor`].
     ///
-    /// Sessions maintain persistent Python state across `execute()` calls,
-    /// unlike `Sandbox` which runs each execution in isolation.
-    ///
-    /// Args:
-    ///     vfs: Optional VfsStorage for persistent file storage.
-    ///         Files written to `/data/*` will persist across executions.
-    ///     vfs_mount_path: Custom mount path for VFS (default: "/data").
-    ///     execution_timeout_ms: Optional timeout in milliseconds for each execution.
-    ///     callbacks: Optional callbacks that sandboxed code can invoke.
-    ///         Can be a CallbackRegistry or a list of callback dicts.
-    ///
-    /// Returns:
-    ///     A new Session instance ready to execute Python code.
-    ///
-    /// Raises:
-    ///     InitializationError: If the session fails to initialize.
-    ///
-    /// Example:
-    ///     # Basic session
-    ///     session = Session()
-    ///     session.execute('x = 42')
-    ///     result = session.execute('print(x)')  # prints "42"
-    ///
-    ///     # Session with VFS
-    ///     storage = VfsStorage()
-    ///     session = Session(vfs=storage)
-    ///     session.execute('open("/data/file.txt", "w").write("data")')
-    ///
-    ///     # Session with callbacks
-    ///     def get_time():
-    ///         import time
-    ///         return {"timestamp": time.time()}
-    ///
-    ///     session = Session(callbacks=[
-    ///         {"name": "get_time", "fn": get_time, "description": "Returns current time"}
-    ///     ])
-    #[new]
-    #[pyo3(signature = (*, vfs=None, vfs_mount_path=None, execution_timeout_ms=None, max_fuel=None, network=None, callbacks=None, mcp=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None))]
+    /// Used by `Session()` (embedded runtime) and by
+    /// `SandboxFactory.create_session()` (factory-backed runtime with packages
+    /// and pre-imports). The executor carries the stdlib/site-packages mounts
+    /// and the result-capture variable name; everything else (VFS, callbacks,
+    /// limits, volumes, output streaming) is configured here.
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn from_executor(
         py: Python<'_>,
-        vfs: Option<VfsStorage>,
-        vfs_mount_path: Option<String>,
+        executor: Arc<eryx::PythonExecutor>,
         execution_timeout_ms: Option<u64>,
         max_fuel: Option<u64>,
+        vfs: Option<VfsStorage>,
+        vfs_mount_path: Option<String>,
         network: Option<NetConfig>,
         callbacks: Option<Bound<'_, PyAny>>,
         mcp: Option<PyRef<'_, crate::mcp::MCPManager>>,
         volumes: Option<Vec<(String, String, bool)>>,
         on_stdout: Option<Py<PyAny>>,
         on_stderr: Option<Py<PyAny>>,
-        result_variable: Option<String>,
+        memory_limit_bytes: Option<u64>,
     ) -> PyResult<Self> {
         // Create a tokio runtime for async execution
         let runtime = Arc::new(
@@ -137,14 +105,6 @@ impl Session {
                     InitializationError::new_err(format!("failed to create runtime: {e}"))
                 })?,
         );
-
-        // Create the PythonExecutor from embedded runtime
-        let mut executor = eryx::PythonExecutor::from_embedded_runtime()
-            .map_err(|e| InitializationError::new_err(format!("failed to create executor: {e}")))?;
-        if let Some(name) = result_variable {
-            executor = executor.with_result_variable(name);
-        }
-        let executor = Arc::new(executor);
 
         // Extract callbacks if provided
         let callbacks_map: Arc<HashMap<String, Arc<dyn eryx::Callback>>> = {
@@ -210,17 +170,22 @@ impl Session {
                         eryx::VfsConfig::default()
                     };
                     config.volumes = volume_mounts;
-                    let session = eryx::SessionExecutor::new_with_vfs_config(
+                    let session = eryx::SessionExecutor::new_with_vfs_config_and_limits(
                         Arc::clone(&executor),
                         &callbacks_vec,
                         storage.clone(),
                         config,
+                        memory_limit_bytes,
                     )
                     .await?;
                     Ok((session, Some(storage)))
                 } else {
-                    let session =
-                        eryx::SessionExecutor::new(Arc::clone(&executor), &callbacks_vec).await?;
+                    let session = eryx::SessionExecutor::new_with_limits(
+                        Arc::clone(&executor),
+                        &callbacks_vec,
+                        memory_limit_bytes,
+                    )
+                    .await?;
                     Ok((session, None))
                 }
             })
@@ -261,6 +226,89 @@ impl Session {
         }
 
         Ok(session)
+    }
+}
+
+#[pymethods]
+impl Session {
+    /// Create a new session with the embedded Python runtime.
+    ///
+    /// Sessions maintain persistent Python state across `execute()` calls,
+    /// unlike `Sandbox` which runs each execution in isolation.
+    ///
+    /// Args:
+    ///     vfs: Optional VfsStorage for persistent file storage.
+    ///         Files written to `/data/*` will persist across executions.
+    ///     vfs_mount_path: Custom mount path for VFS (default: "/data").
+    ///     execution_timeout_ms: Optional timeout in milliseconds for each execution.
+    ///     callbacks: Optional callbacks that sandboxed code can invoke.
+    ///         Can be a CallbackRegistry or a list of callback dicts.
+    ///
+    /// Returns:
+    ///     A new Session instance ready to execute Python code.
+    ///
+    /// Raises:
+    ///     InitializationError: If the session fails to initialize.
+    ///
+    /// Example:
+    ///     # Basic session
+    ///     session = Session()
+    ///     session.execute('x = 42')
+    ///     result = session.execute('print(x)')  # prints "42"
+    ///
+    ///     # Session with VFS
+    ///     storage = VfsStorage()
+    ///     session = Session(vfs=storage)
+    ///     session.execute('open("/data/file.txt", "w").write("data")')
+    ///
+    ///     # Session with callbacks
+    ///     def get_time():
+    ///         import time
+    ///         return {"timestamp": time.time()}
+    ///
+    ///     session = Session(callbacks=[
+    ///         {"name": "get_time", "fn": get_time, "description": "Returns current time"}
+    ///     ])
+    #[new]
+    #[pyo3(signature = (*, vfs=None, vfs_mount_path=None, execution_timeout_ms=None, max_fuel=None, network=None, callbacks=None, mcp=None, volumes=None, on_stdout=None, on_stderr=None, result_variable=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        vfs: Option<VfsStorage>,
+        vfs_mount_path: Option<String>,
+        execution_timeout_ms: Option<u64>,
+        max_fuel: Option<u64>,
+        network: Option<NetConfig>,
+        callbacks: Option<Bound<'_, PyAny>>,
+        mcp: Option<PyRef<'_, crate::mcp::MCPManager>>,
+        volumes: Option<Vec<(String, String, bool)>>,
+        on_stdout: Option<Py<PyAny>>,
+        on_stderr: Option<Py<PyAny>>,
+        result_variable: Option<String>,
+    ) -> PyResult<Self> {
+        // Create the PythonExecutor from embedded runtime
+        let mut executor = eryx::PythonExecutor::from_embedded_runtime()
+            .map_err(|e| InitializationError::new_err(format!("failed to create executor: {e}")))?;
+        if let Some(name) = result_variable {
+            executor = executor.with_result_variable(name);
+        }
+        let executor = Arc::new(executor);
+
+        Self::from_executor(
+            py,
+            executor,
+            execution_timeout_ms,
+            max_fuel,
+            vfs,
+            vfs_mount_path,
+            network,
+            callbacks,
+            mcp,
+            volumes,
+            on_stdout,
+            on_stderr,
+            None, // Embedded sessions keep the historical no-memory-limit behavior
+        )
     }
 
     /// Execute Python code in the session.
