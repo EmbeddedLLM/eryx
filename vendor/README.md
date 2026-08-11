@@ -22,3 +22,10 @@ via `[patch.crates-io]` in the workspace `Cargo.toml`.
 
 To refresh from upstream: re-copy the crate from the cargo registry cache and
 re-apply the one-line limits.rs change; keep the README in sync.
+
+The pyeryx wheel for this fix is built from `crates/eryx-python`:
+`maturin build --release` (or `maturin develop --release` into a venv) with
+the workspace `[patch.crates-io]` active, then published as release
+`v0.5.0-instance-cap.1` on this fork (asset
+`pyeryx-0.5.0-cp312-abi3-manylinux_2_39_x86_64.whl`, sha256
+d42f2d01ab097198258d0a621d96b8f59c7ca62593663675f134c697b25a8bc2).
