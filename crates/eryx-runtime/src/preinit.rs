@@ -259,7 +259,7 @@ fn restore_initialize_exports(component_bytes: &[u8]) -> Result<Vec<u8>> {
                         }
                     }
                     wasmparser::Payload::ImportSection(reader) => {
-                        for import in reader {
+                        for import in reader.into_imports() {
                             if import?.name == "_initialize" {
                                 any_module_imports_init = true;
                             }
@@ -374,7 +374,7 @@ fn add_noop_initialize(module_bytes: &[u8]) -> Result<Vec<u8>> {
                 }
             }
             wasmparser::Payload::ImportSection(reader) => {
-                for import in reader {
+                for import in reader.into_imports() {
                     if matches!(import?.ty, wasmparser::TypeRef::Func(_)) {
                         num_imported_funcs += 1;
                     }

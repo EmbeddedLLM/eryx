@@ -95,8 +95,8 @@ tracing = "0.1"
 
 # Directory walking
 walkdir = "2.5"
-wasm-encoder = "0.243"
-wasmparser = "0.243"
+wasm-encoder = "0.246"
+wasmparser = "0.246"
 
 # WebAssembly runtime (v40+ required for async component model)
 # 44.0.2 patches GHSA-2r75-cxrj-cmph (WASI path_open TRUNCATE bypasses FilePerms::WRITE)
@@ -106,12 +106,12 @@ wasmtime-wasi-io = "44.0.2"
 wasmtime-wizer = { version = "44.0.2", features = ["component-model", "wasmtime"] }
 
 # WebAssembly component linking and WIT parsing
-wit-component = "0.243"
-wit-dylib = "0.243"
+wit-component = "0.246"
+wit-dylib = "0.246"
 
 # wit-dylib FFI for implementing interpreter interface (inlined from wasm-tools)
 wit-dylib-ffi = { path = "crates/wit-dylib-ffi" }
-wit-parser = "0.243"
+wit-parser = "0.246"
 zip = "2.0"
 
 # Compression
@@ -164,3 +164,16 @@ wasmtime-wizer.debug-assertions = false
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# ── wasmparser instance-cap patch (fix/wasm-instance-cap) ───────────────────
+# The component-model validator caps component instances at 1000
+# (wasmparser MAX_WASM_INSTANCES — a DoS guard, not a spec limit). The full
+# wasi-python-layer site (144 native extensions) + scipy (102) = 246
+# extensions, over the ~230-extension empirical cap: SandboxFactory builds fail with
+# "instances count exceeds limit of 1000" at both encode (wit-component ->
+# wasmparser) and instantiate (wasmtime 44 -> wasmparser 0.246.2).
+# wit-component is aligned to the 0.246 generation so ONE vendored version
+# covers both validate paths. Bump the guard to 4096 (vendor/
+# wasmparser-0.246.2/src/limits.rs).
+[patch.crates-io]
+wasmparser = { path = "vendor/wasmparser-0.246.2" }
