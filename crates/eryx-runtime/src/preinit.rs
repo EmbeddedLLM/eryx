@@ -194,7 +194,7 @@ pub async fn pre_initialize(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(128);
-    store.set_hostcall_fuel(hostcall_fuel_mb * 1024 * 1024);
+    store.set_hostcall_fuel((hostcall_fuel_mb * 1024 * 1024) as usize);
 
     // Create linker and add WASI
     let mut linker = Linker::new(&engine);
