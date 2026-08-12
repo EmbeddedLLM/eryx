@@ -48,6 +48,29 @@ pub(crate) fn epoch_ticks(timeout: Duration) -> u64 {
     u64::try_from(ticks).unwrap_or(u64::MAX / 2).max(1)
 }
 
+/// Whether WASM fuel metering is enabled (`ERYX_FUEL_MODE=off` disables it).
+///
+/// Disabling fuel removes the per-instruction accounting overhead (wasmtime's
+/// own docs: fuel vs epoch instrumentation can differ "up to 2-3x"). Timeouts
+/// and cancellation stay epoch-based (see the deadline setup below), and
+/// suspension halts via the epoch deadline instead of fuel poisoning. Default
+/// ON — fuel is the billing/metering primitive (R1 perf knob, 2026-08-12).
+pub(crate) fn fuel_metering_enabled() -> bool {
+    std::env::var("ERYX_FUEL_MODE").as_deref() != Ok("off")
+}
+
+/// Hostcall fuel budget in MiB (`ERYX_HOSTCALL_FUEL_MB`, default 128 = wasmtime's
+/// `DEFAULT_HOSTCALL_FUEL`). Raised for factory pre-init + runtime stores so
+/// wizer can pre-import larger modules (scipy/skimage) without "fuel allocated
+/// for hostcalls has been exhausted" (A3, 2026-08-12).
+pub(crate) fn hostcall_fuel_bytes() -> u64 {
+    let mib = std::env::var("ERYX_HOSTCALL_FUEL_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    mib * 1024 * 1024
+}
+
 /// The result a callback handler sends back to the `invoke` host import.
 ///
 /// Distinguishes a successful result and an ordinary error (both surface to
@@ -555,7 +578,17 @@ impl SandboxImportsWithStore for HasSelf<ExecutorState> {
                             // gates.
                             accessor.with(|mut access| {
                                 access.get().suspended = Some(reason.clone());
-                                let _ = access.as_context_mut().set_fuel(0);
+                                if fuel_metering_enabled() {
+                                    // Poison fuel so the guest traps at its next
+                                    // fuel-metered instruction.
+                                    let _ = access.as_context_mut().set_fuel(0);
+                                } else {
+                                    // No fuel metering (ERYX_FUEL_MODE=off): halt
+                                    // via the epoch deadline — the ticker bumps the
+                                    // engine epoch continuously, so deadline 0
+                                    // fires the deadline callback/trap immediately.
+                                    access.as_context_mut().set_epoch_deadline(0);
+                                }
                             });
                             // The return value is moot: the guest traps before it
                             // can observe it. Surface the reason for completeness.
@@ -1835,11 +1868,15 @@ impl PythonExecutor {
         // that don't yield to the async runtime (e.g., `while True: pass`).
         config.epoch_interruption(true);
 
-        // Enable fuel consumption for instruction tracking and limiting.
+        // Enable fuel consumption for instruction tracking and limiting
+        // (skip when ERYX_FUEL_MODE=off — the R1 perf knob; timeouts stay
+        // epoch-based and suspension falls back to the epoch deadline).
         // Fuel provides fine-grained, deterministic execution bounds at the
         // instruction level. Even when no limit is set, fuel consumption is
         // tracked and reported for billing/metering purposes.
-        config.consume_fuel(true);
+        if fuel_metering_enabled() {
+            config.consume_fuel(true);
+        }
 
         // Enable copy-on-write heap images for faster instantiation
         // This defers memory initialization from instantiation time to first write
@@ -1886,7 +1923,9 @@ impl PythonExecutor {
         config.wasm_component_model(true);
         config.wasm_component_model_async(true);
         config.epoch_interruption(true);
-        config.consume_fuel(true);
+        if fuel_metering_enabled() {
+            config.consume_fuel(true);
+        }
         config.memory_init_cow(true);
         config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
         config.async_stack_size(512 * 1024);
@@ -2352,6 +2391,10 @@ impl PythonExecutor {
 
         // Create store for this execution
         let mut store = Store::new(&self.engine, state);
+        // A3 (2026-08-12): raise the hostcall data-copy budget above wasmtime's
+        // 128 MiB default so preloaded modules / result transfers don't hit
+        // "fuel allocated for hostcalls has been exhausted" (ERYX_HOSTCALL_FUEL_MB).
+        store.set_hostcall_fuel(hostcall_fuel_bytes().try_into().unwrap());
 
         // Register the memory tracker as a resource limiter
         store.limiter(|state| &mut state.memory_tracker);
@@ -2362,10 +2405,14 @@ impl PythonExecutor {
 
         // Set up fuel for tracking/limiting. We use u64::MAX for tracking-only mode
         // when no explicit limit is set. Fuel is consumed per WASM instruction.
+        // (Skipped under ERYX_FUEL_MODE=off — the R1 perf knob; fuel_consumed
+        // is reported as None in that mode.)
         let initial_fuel = fuel_limit.unwrap_or(u64::MAX);
-        store
-            .set_fuel(initial_fuel)
-            .map_err(|e| Error::Initialization(format!("Failed to set fuel: {e}")))?;
+        if fuel_metering_enabled() {
+            store
+                .set_fuel(initial_fuel)
+                .map_err(|e| Error::Initialization(format!("Failed to set fuel: {e}")))?;
+        }
 
         // Instantiate from the pre-compiled template (includes Python initialization)
         let bindings = self
@@ -2399,7 +2446,11 @@ impl PythonExecutor {
             let mut timeout_ticks = execution_timeout.map(epoch_ticks);
             let was_cancelled_clone = Arc::clone(&was_cancelled);
             store.set_epoch_deadline(1);
-            store.epoch_deadline_callback(move |_store| {
+            store.epoch_deadline_callback(move |deadline_store| {
+                // Suspension without fuel metering halts via the deadline.
+                if deadline_store.data().suspended.is_some() {
+                    return Ok(UpdateDeadline::Interrupt);
+                }
                 if cancel_token.is_cancelled() {
                     was_cancelled_clone.store(true, Ordering::Relaxed);
                     return Ok(UpdateDeadline::Interrupt);
@@ -2499,9 +2550,13 @@ impl PythonExecutor {
         // Get peak memory from the store before it's dropped
         let peak_memory_bytes = store.data().memory_tracker.peak_memory_bytes();
 
-        // Calculate fuel consumed during execution
-        let remaining_fuel = store.get_fuel().unwrap_or(0);
-        let fuel_consumed = Some(initial_fuel.saturating_sub(remaining_fuel));
+        // Calculate fuel consumed during execution (None under ERYX_FUEL_MODE=off)
+        let fuel_consumed = if fuel_metering_enabled() {
+            let remaining_fuel = store.get_fuel().unwrap_or(0);
+            Some(initial_fuel.saturating_sub(remaining_fuel))
+        } else {
+            None
+        };
 
         // Note: callback_invocations is 0 here because PythonExecutor doesn't
         // handle callbacks internally - it just passes the channel to the WASM state.

@@ -185,6 +185,17 @@ pub async fn pre_initialize(
         },
     );
 
+    // A3 (2026-08-12): raise the hostcall data-copy budget above wasmtime's
+    // 128 MiB default (ERYX_HOSTCALL_FUEL_MB) so the wizer pre-init can import
+    // the full pre-import list (scipy/skimage) without "fuel allocated for
+    // hostcalls has been exhausted". Store::set_hostcall_fuel is public API —
+    // no wasmtime vendoring needed.
+    let hostcall_fuel_mb = std::env::var("ERYX_HOSTCALL_FUEL_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(128);
+    store.set_hostcall_fuel(hostcall_fuel_mb * 1024 * 1024);
+
     // Create linker and add WASI
     let mut linker = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
