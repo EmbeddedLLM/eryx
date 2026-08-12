@@ -1817,7 +1817,10 @@ impl PythonExecutor {
     /// - v1: Initial configuration
     /// - v2: Added epoch_interruption(true) for execution timeouts
     /// - v3: Added consume_fuel(true) for instruction tracking/limiting
-    pub const ENGINE_CONFIG_VERSION: u32 = 3;
+    /// - v4: ERYX_FUEL_MODE=off knob (consume_fuel gated) + hostcall-fuel
+    ///   raise — precompiled artifacts are settings-specific, so a fuel-off
+    ///   cwasm/factory is NOT loadable by a fuel-on engine and vice versa.
+    pub const ENGINE_CONFIG_VERSION: u32 = 4;
 
     /// Create a configured wasmtime engine.
     ///

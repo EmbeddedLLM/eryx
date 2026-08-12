@@ -819,6 +819,9 @@ impl SessionExecutor {
 
         // Create store
         let mut store = Store::new(executor.engine(), state);
+        // A3 (2026-08-12): raise the hostcall data-copy budget above wasmtime's
+        // 128 MiB default (ERYX_HOSTCALL_FUEL_MB).
+        store.set_hostcall_fuel(crate::wasm::hostcall_fuel_bytes().try_into().unwrap());
 
         // Register the memory tracker as a resource limiter
         store.limiter(|state| &mut state.memory_tracker);
@@ -830,9 +833,12 @@ impl SessionExecutor {
 
         // Set initial fuel - required when consume_fuel is enabled in the engine config.
         // We use u64::MAX for tracking-only mode; actual limits are applied per-execution.
-        store
-            .set_fuel(u64::MAX)
-            .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
+        // (Skipped under ERYX_FUEL_MODE=off — the R1 perf knob.)
+        if crate::wasm::fuel_metering_enabled() {
+            store
+                .set_fuel(u64::MAX)
+                .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
+        }
 
         // Instantiate the component
         let bindings = executor
@@ -889,6 +895,9 @@ impl SessionExecutor {
 
         // Create store
         let mut store = Store::new(executor.engine(), state);
+        // A3 (2026-08-12): raise the hostcall data-copy budget above wasmtime's
+        // 128 MiB default (ERYX_HOSTCALL_FUEL_MB).
+        store.set_hostcall_fuel(crate::wasm::hostcall_fuel_bytes().try_into().unwrap());
 
         // Register the memory tracker as a resource limiter
         store.limiter(|state| &mut state.memory_tracker);
@@ -898,9 +907,12 @@ impl SessionExecutor {
 
         // Set initial fuel - required when consume_fuel is enabled in the engine config.
         // We use u64::MAX for tracking-only mode; actual limits are applied per-execution.
-        store
-            .set_fuel(u64::MAX)
-            .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
+        // (Skipped under ERYX_FUEL_MODE=off — the R1 perf knob.)
+        if crate::wasm::fuel_metering_enabled() {
+            store
+                .set_fuel(u64::MAX)
+                .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
+        }
 
         // Instantiate the component
         let bindings = executor
@@ -1094,10 +1106,17 @@ impl SessionExecutor {
         // Set up fuel for tracking/limiting. Per-execution limit takes precedence
         // over session-level limit. We use u64::MAX for tracking-only mode.
         let fuel_limit = per_execute_fuel_limit.or(self.fuel_limit);
+        if fuel_limit.is_some() && !crate::wasm::fuel_metering_enabled() {
+            return Err(Error::Initialization(
+                "max_fuel requires ERYX_FUEL_MODE=on (fuel metering disabled)".into(),
+            ));
+        }
         let initial_fuel = fuel_limit.unwrap_or(u64::MAX);
-        store
-            .set_fuel(initial_fuel)
-            .map_err(|e| Error::Initialization(format!("Failed to set fuel: {e}")))?;
+        if crate::wasm::fuel_metering_enabled() {
+            store
+                .set_fuel(initial_fuel)
+                .map_err(|e| Error::Initialization(format!("Failed to set fuel: {e}")))?;
+        }
 
         tracing::debug!(
             code_len = code.len(),
@@ -1168,11 +1187,18 @@ impl SessionExecutor {
             state.peak_memory_bytes()
         };
 
-        // Get remaining fuel after execution
-        let remaining_fuel = store.get_fuel().unwrap_or(0);
-
-        // Calculate fuel consumed during execution
-        let fuel_consumed = Some(initial_fuel.saturating_sub(remaining_fuel));
+        // Get remaining fuel after execution (hoisted before the store move;
+        // None/0 under ERYX_FUEL_MODE=off)
+        let remaining_fuel = if crate::wasm::fuel_metering_enabled() {
+            store.get_fuel().unwrap_or(0)
+        } else {
+            0
+        };
+        let fuel_consumed = if crate::wasm::fuel_metering_enabled() {
+            Some(initial_fuel.saturating_sub(remaining_fuel))
+        } else {
+            None
+        };
 
         // Restore store and bindings before handling result
         self.store = Some(store);
@@ -1185,7 +1211,13 @@ impl SessionExecutor {
             if async_timeout_elapsed
                 || e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt)
             {
-                Error::Timeout(execution_timeout.unwrap_or_default())
+                // Suspension without fuel metering halts via the epoch deadline
+                // (Trap::Interrupt) — classify by the suspension flag first.
+                if let Some(reason) = suspended_reason.clone() {
+                    Error::Suspended(reason)
+                } else {
+                    Error::Timeout(execution_timeout.unwrap_or_default())
+                }
             } else if e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) {
                 if let Some(reason) = suspended_reason.clone() {
                     Error::Suspended(reason)
@@ -1304,9 +1336,12 @@ impl SessionExecutor {
 
         // Set initial fuel - required when consume_fuel is enabled in the engine config.
         // We use u64::MAX for tracking-only mode; actual limits are applied per-execution.
-        store
-            .set_fuel(u64::MAX)
-            .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
+        // (Skipped under ERYX_FUEL_MODE=off — the R1 perf knob.)
+        if crate::wasm::fuel_metering_enabled() {
+            store
+                .set_fuel(u64::MAX)
+                .map_err(|e| Error::WasmEngine(format!("Failed to set fuel: {e}")))?;
+        }
 
         // Preserve settings across reset
         let execution_timeout = self.execution_timeout;
