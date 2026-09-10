@@ -267,20 +267,11 @@ impl SandboxFactory {
                     InitializationError::new_err(format!("failed to create runtime: {e}"))
                 })?,
         );
-        // The artifact bytes are loaded directly because `PrecompiledArtifact`
-        // exposes no public executor-construction API, so the process-global
-        // `InstancePreCache` cannot be consulted here: a `cache=True` factory
-        // re-deserializes the component per session, unlike `create_sandbox()`,
-        // which routes it through `SandboxBuilder::with_precompiled_artifact`.
-        // Reusing the cached `InstancePre` is deliberately left to the follow-up
-        // session-performance work, which benchmarks creation before and after.
         // SAFETY: the bytes were produced by `PythonExecutor::precompile` or
         // loaded from a factory file created by this same API.
-        let mut executor =
-            unsafe { eryx::PythonExecutor::from_precompiled(self.precompiled.as_bytes()) }
-                .map_err(|e| {
-                    InitializationError::new_err(format!("failed to load factory runtime: {e}"))
-                })?;
+        let mut executor = unsafe { self.precompiled.to_executor() }.map_err(|e| {
+            InitializationError::new_err(format!("failed to load factory runtime: {e}"))
+        })?;
         executor = executor.with_python_stdlib(&self.stdlib_path);
         if let Some(path) = &self.site_packages_path {
             executor = executor.with_site_packages(path);

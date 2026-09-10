@@ -169,6 +169,9 @@ impl Session {
                 }
             })
             .map_err(eryx_error_to_py)?;
+        let callback_limits = eryx::ResourceLimits::unlimited()
+            .with_callback_timeout(limits.callback_timeout)
+            .with_max_callback_invocations(limits.max_callback_invocations);
         let output_handler = if on_stdout.is_some() || on_stderr.is_some() {
             Some(Arc::new(PyOutputHandler {
                 on_stdout,
@@ -187,7 +190,7 @@ impl Session {
             net_config: network.map(Into::into),
             output_handler,
             package_storage_owner,
-            callback_limits: limits,
+            callback_limits,
         })
     }
 }

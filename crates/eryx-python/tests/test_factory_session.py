@@ -83,6 +83,7 @@ def test_factory_session_callback_count_applies_after_reset(sandbox_factory):
         callbacks=[{"name": "count", "fn": callback}],
         resource_limits=eryx.ResourceLimits(max_callback_invocations=1),
     )
+    # max_callback_invocations is per execution, so both single-callback calls succeed.
     assert session.execute("print(await count())").stdout == "1"
     assert session.execute("print(await count())").stdout == "2"
     session.reset()
@@ -203,3 +204,51 @@ def test_factory_session_preimport_and_local_wheel_lifetime(sandbox_factory, tmp
     assert session.execute("import tiny_late; print(tiny_late.VALUE)").stdout == "42"
     session.reset()
     assert session.execute("import tiny_late; print(tiny_late.VALUE)").stdout == "42"
+
+
+def test_saved_factory_session_lazily_imports_from_supplied_site_packages(tmp_path):
+    site_packages = tmp_path / "site-packages"
+    package = site_packages / "saved_factory_package"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 42\n")
+
+    save_path = tmp_path / "factory.bin"
+    factory = eryx.SandboxFactory(site_packages=site_packages, imports=[])
+    factory.save(save_path)
+
+    loaded = eryx.SandboxFactory.load(save_path, site_packages=site_packages)
+    session = loaded.create_session()
+    assert (
+        session.execute(
+            "import sys; print('saved_factory_package' not in sys.modules)"
+        ).stdout
+        == "True"
+    )
+    assert (
+        session.execute(
+            "import saved_factory_package; print(saved_factory_package.VALUE)"
+        ).stdout
+        == "42"
+    )
+
+
+def test_cached_loaded_factory_sessions_are_isolated_and_equivalent(
+    sandbox_factory, tmp_path
+):
+    save_path = tmp_path / "cached-factory.bin"
+    sandbox_factory.save(save_path)
+    loaded = eryx.SandboxFactory.load(save_path, cache=True)
+
+    first = loaded.create_session()
+    second = loaded.create_session()
+    assert first.execute("print('clean' if 'state' not in globals() else 'dirty')").stdout == (
+        "clean"
+    )
+    assert second.execute("print('clean' if 'state' not in globals() else 'dirty')").stdout == (
+        "clean"
+    )
+
+    first.execute("state = 'first'")
+    second.execute("state = 'second'")
+    assert first.execute("print(state)").stdout == "first"
+    assert second.execute("print(state)").stdout == "second"
