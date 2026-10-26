@@ -141,6 +141,11 @@ struct PreInitCtx {
     /// Temp directory for dummy files - must be kept alive during pre-init
     #[allow(dead_code)]
     temp_dir: Option<TempDir>,
+    /// Writable guest `/tmp` used while imports are pre-initialized.
+    /// Kept alive until after snapshotting, but its handles are reset before
+    /// the snapshot is taken.
+    #[allow(dead_code)]
+    tmp_dir: TempDir,
     /// What the `list-callbacks` import answers, sorted by name.
     callbacks: Vec<CallbackDeclaration>,
 }
@@ -294,6 +299,13 @@ pub async fn pre_initialize_with_options(options: PreInitOptions) -> Result<Vec<
         Some(temp)
     };
 
+    // Python packages may need a writable temporary directory during import
+    // (for example, matplotlib creates its configuration cache there). Keep
+    // this private host directory alive for the whole pre-init, but expose
+    // only that directory to the guest at `/tmp`.
+    let tmp_dir = TempDir::new()?;
+    wasi_builder.preopened_dir(tmp_dir.path(), "tmp", FsPerms::ReadWrite)?;
+
     let wasi = wasi_builder.build();
 
     let has_callbacks = !callbacks.is_empty();
@@ -303,6 +315,7 @@ pub async fn pre_initialize_with_options(options: PreInitOptions) -> Result<Vec<
             wasi,
             table,
             temp_dir,
+            tmp_dir,
             callbacks,
         },
     );

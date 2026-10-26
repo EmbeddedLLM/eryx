@@ -346,6 +346,24 @@ print(json.dumps([1, 2, 3]))
     assert!(result.stdout_text().contains("[1, 2, 3]"));
 }
 
+#[tokio::test]
+async fn preinit_provides_writable_tmp_with_site_packages() {
+    let stdlib = get_stdlib_path();
+    let setup = r#"
+import tempfile
+assert tempfile.gettempdir() == '/tmp'
+with tempfile.NamedTemporaryFile() as f:
+    f.write(b'preinit temp works')
+    f.flush()
+    f.seek(0)
+    assert f.read() == b'preinit temp works'
+"#;
+
+    pre_initialize(&stdlib, Some(&stdlib), &[], &[], Some(setup))
+        .await
+        .expect("pre-initialization should provide writable /tmp");
+}
+
 /// Test that imports work within a single execute call (multi-statement).
 #[tokio::test]
 async fn preinit_imports_work_within_execution() {
