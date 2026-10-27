@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // Re-export pyo3::ffi types and functions available in the stable ABI
 pub use pyo3::ffi::{
+    // Compile/evaluate cached callback setup code
+    Py_CompileString,
     // Reference counting
     Py_DecRef,
     // Interpreter lifecycle
@@ -44,6 +46,8 @@ pub use pyo3::ffi::{
     PyErr_GetRaisedException,
     PyErr_Occurred,
     PyErr_SetString,
+    PyEval_EvalCode,
+    PyEval_GetBuiltins,
     // Exception types
     PyExc_AttributeError,
     PyExc_BaseException,
@@ -90,6 +94,7 @@ pub use pyo3::ffi::{
 
 // Functions not available in pyo3-ffi stable ABI (abi3)
 unsafe extern "C" {
+    pub fn PySys_Audit(event: *const c_char, arg_format: *const c_char, ...) -> std::ffi::c_int;
     pub fn PyRun_String(
         str: *const c_char,
         start: std::ffi::c_int,
@@ -1274,10 +1279,102 @@ static PYTHON_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// fresh instance with no callbacks never runs the setup script.
 static INSTALLED_CALLBACKS: Mutex<Option<String>> = Mutex::new(None);
 
+/// The most recently compiled callback setup script. Keeping this separate
+/// from `INSTALLED_CALLBACKS` lets clear/restore invalidate the installed
+/// wrappers without recompiling the same setup source on the next execute.
+/// `code` owns one CPython reference in the current interpreter snapshot.
+struct CallbackSetupCode {
+    callbacks_json: String,
+    code: *mut PyObject,
+}
+
+// SAFETY: guest execution is single-threaded. The pointer owns a reference in
+// the current CPython heap, which is snapshot along with the guest memory.
+unsafe impl Send for CallbackSetupCode {}
+
+static CALLBACK_SETUP_CODE: Mutex<Option<CallbackSetupCode>> = Mutex::new(None);
+
 /// Forget which callbacks are installed so the next setup reinstalls them.
 fn invalidate_installed_callbacks() {
     if let Ok(mut installed) = INSTALLED_CALLBACKS.lock() {
         *installed = None;
+    }
+}
+
+/// Return a temporary owned reference to the compiled setup code for this
+/// callback set, compiling and replacing the one-entry cache when necessary.
+///
+/// No Python API calls that can execute guest code happen while the cache lock
+/// is held: compilation can invoke audit hooks, and decref may run finalizers.
+///
+/// # Safety
+/// Python must be initialized, and the source must be valid Python setup code.
+unsafe fn callback_setup_code(
+    callbacks_json: &str,
+    source: &std::ffi::CStr,
+) -> Result<*mut PyObject, String> {
+    if let Ok(cache) = CALLBACK_SETUP_CODE.lock()
+        && let Some(cached) = cache.as_ref()
+        && cached.callbacks_json == callbacks_json
+    {
+        let code = cached.code;
+        unsafe { Py_IncRef(code) };
+        return Ok(code);
+    }
+
+    let code = unsafe { Py_CompileString(source.as_ptr(), c"<string>".as_ptr(), PY_FILE_INPUT) };
+    if code.is_null() {
+        return Err(unsafe { get_last_error_message() });
+    }
+
+    let replaced = if let Ok(mut cache) = CALLBACK_SETUP_CODE.lock() {
+        // The reference returned by Py_CompileString belongs to the caller;
+        // keep a second reference for the cache across clear/restore calls.
+        unsafe { Py_IncRef(code) };
+        cache.replace(CallbackSetupCode {
+            callbacks_json: callbacks_json.to_owned(),
+            code,
+        })
+    } else {
+        None
+    };
+    if let Some(replaced) = replaced {
+        unsafe { Py_DecRef(replaced.code) };
+    }
+
+    Ok(code)
+}
+
+/// Evaluate compiled callback setup code in `__main__`'s namespace, preserving
+/// the `exec` audit event emitted by `PyRun_String` without looking up the
+/// mutable Python `exec` builtin.
+///
+/// # Safety
+/// Python must be initialized and `code` must be a live code object.
+unsafe fn eval_callback_setup(code: *mut PyObject) -> Result<(), String> {
+    unsafe {
+        if PySys_Audit(c"exec".as_ptr(), c"O".as_ptr(), code) != 0 {
+            return Err(get_last_error_message());
+        }
+        let main_module = PyImport_AddModule(c"__main__".as_ptr());
+        if main_module.is_null() {
+            return Err(get_last_error_message());
+        }
+        let main_dict = PyModule_GetDict(main_module);
+        if main_dict.is_null() {
+            return Err(get_last_error_message());
+        }
+        if PyDict_GetItemString(main_dict, c"__builtins__".as_ptr()).is_null()
+            && PyDict_SetItemString(main_dict, c"__builtins__".as_ptr(), PyEval_GetBuiltins()) != 0
+        {
+            return Err(get_last_error_message());
+        }
+        let result = PyEval_EvalCode(code, main_dict, main_dict);
+        if result.is_null() {
+            return Err(get_last_error_message());
+        }
+        Py_DecRef(result);
+        Ok(())
     }
 }
 
@@ -3538,11 +3635,9 @@ pub struct CallbackInfo {
 /// 3. Direct wrapper functions for each callback (e.g., `sleep(ms=100)`)
 /// 4. Namespace objects for dotted callbacks (e.g., `http.get(url="...")`)
 ///
-/// Installing is idempotent: the declarations are compared with the set that
-/// is already installed and the setup script only runs when they differ. The
-/// script compiles a few hundred lines of Python, which is several times the
-/// cost of a short execution, so this is what keeps per-execution overhead
-/// low for sessions and for sandboxes with callbacks.
+/// Setup is skipped while these declarations remain installed. Clear or
+/// restore invalidates the installation so wrappers are restored; the most
+/// recently compiled setup script is reused to avoid recompiling it.
 pub fn setup_callbacks(callbacks: &[CallbackInfo]) -> Result<(), String> {
     if !is_python_initialized() {
         return Err("Python not initialized".to_string());
@@ -3794,10 +3889,13 @@ except NameError:
             callbacks_json.replace('\\', "\\\\").replace('\'', "\\'")
         );
 
-        // Run the setup code
         let setup_cstr =
             std::ffi::CString::new(setup_code).map_err(|e| format!("Invalid setup code: {e}"))?;
-        run_in_main(&setup_cstr).map_err(|err| format!("Failed to set up callbacks: {err}"))?;
+        let code = callback_setup_code(&callbacks_json, &setup_cstr)
+            .map_err(|err| format!("Failed to set up callbacks: {err}"))?;
+        let result = eval_callback_setup(code);
+        Py_DecRef(code);
+        result.map_err(|err| format!("Failed to set up callbacks: {err}"))?;
     }
 
     if let Ok(mut installed) = INSTALLED_CALLBACKS.lock() {

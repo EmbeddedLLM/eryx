@@ -95,11 +95,11 @@ fn echo_and_ping() -> Vec<Arc<dyn Callback>> {
 
 /// Run `code` on `session` with `callbacks` available, serving their
 /// invocations with the same handler `Sandbox` uses.
-async fn run(
+async fn run_result(
     session: &mut SessionExecutor,
     callbacks: &[Arc<dyn Callback>],
     code: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, eryx::Error> {
     let (callback_tx, callback_rx) = tokio::sync::mpsc::channel(4);
     let callbacks_map: HashMap<String, Arc<dyn Callback>> = callbacks
         .iter()
@@ -112,14 +112,24 @@ async fn run(
         Arc::new(HashMap::new()),
     ));
 
-    let output = session
+    let result = session
         .execute(code)
         .with_callbacks(callbacks, callback_tx)
         .run()
         .await
-        .expect("execution failed");
+        .map(|output| output.stdout);
     handler.await.unwrap();
-    output.stdout
+    result
+}
+
+async fn run(
+    session: &mut SessionExecutor,
+    callbacks: &[Arc<dyn Callback>],
+    code: &str,
+) -> Vec<u8> {
+    run_result(session, callbacks, code)
+        .await
+        .expect("execution failed")
 }
 
 #[tokio::test]
@@ -184,7 +194,7 @@ async fn callbacks_survive_clear_state() {
         run(
             &mut session,
             &callbacks,
-            "x = 1\nprint(await echo(data='a'))"
+            "x = 1\nprint(await echo(data='a'))\necho = 'tampered'"
         )
         .await,
         b"a\n"
@@ -198,6 +208,154 @@ async fn callbacks_survive_clear_state() {
         )
         .await,
         b"False b\n"
+    );
+}
+
+#[tokio::test]
+async fn clear_state_reuses_compiled_empty_callback_setup() {
+    let callbacks: Vec<Arc<dyn Callback>> = Vec::new();
+    let mut session = SessionExecutor::new(executor(), &callbacks).await.unwrap();
+
+    run(
+        &mut session,
+        &callbacks,
+        r#"
+import sys
+import builtins
+sys._eryx_callback_setup_compiles = 0
+def _eryx_track_callback_setup(event, args, _sys=sys):
+    if event == 'compile':
+        source = args[0]
+        if isinstance(source, str):
+            source = source.encode('utf-8', 'replace')
+        if b'_eryx_callbacks_json' in source:
+            _sys._eryx_callback_setup_compiles += 1
+    elif event == 'exec' and '_eryx_callbacks_json' in args[0].co_names:
+        _sys._eryx_probe_builtins.exec = _sys._eryx_original_exec
+sys.addaudithook(_eryx_track_callback_setup)
+sys._eryx_probe_builtins = builtins
+sys._eryx_original_exec = builtins.exec
+builtins.exec = lambda *args: None
+invoke = None
+list_callbacks = None
+"#,
+    )
+    .await;
+
+    session.clear_state().await.unwrap();
+    assert_eq!(
+        run(
+            &mut session,
+            &callbacks,
+            "import sys; print(callable(invoke), list_callbacks(), sys._eryx_callback_setup_compiles)"
+        )
+        .await,
+        b"True [] 0\n"
+    );
+}
+
+#[tokio::test]
+async fn changed_callback_setup_code_is_cached_and_reinstalled() {
+    let initial_callbacks = echo_only();
+    let changed_callbacks = echo_and_ping();
+    let mut session = SessionExecutor::new(executor(), &initial_callbacks)
+        .await
+        .unwrap();
+
+    run(
+        &mut session,
+        &initial_callbacks,
+        r#"
+import sys
+sys._eryx_callback_setup_compiles = 0
+def _eryx_track_callback_setup(event, args, _sys=sys):
+    if event == 'compile':
+        source = args[0]
+        if isinstance(source, str):
+            source = source.encode('utf-8', 'replace')
+        if b'_eryx_callbacks_json' in source:
+            _sys._eryx_callback_setup_compiles += 1
+sys.addaudithook(_eryx_track_callback_setup)
+"#,
+    )
+    .await;
+
+    session.clear_state().await.unwrap();
+    assert_eq!(
+        run(
+            &mut session,
+            &initial_callbacks,
+            "print(await echo(data='same set after clear'))"
+        )
+        .await,
+        b"same set after clear\n"
+    );
+
+    session.clear_state().await.unwrap();
+    assert_eq!(
+        run(&mut session, &changed_callbacks, "print(await ping())").await,
+        b"pong\n"
+    );
+
+    session.clear_state().await.unwrap();
+    assert_eq!(
+        run(
+            &mut session,
+            &changed_callbacks,
+            "import sys; print(sys._eryx_callback_setup_compiles, await ping())"
+        )
+        .await,
+        b"1 pong\n"
+    );
+}
+
+#[tokio::test]
+async fn failed_callback_setup_can_retry_from_the_cached_code() {
+    let empty_callbacks: Vec<Arc<dyn Callback>> = Vec::new();
+    let callbacks = echo_only();
+    let mut session = SessionExecutor::new(executor(), &empty_callbacks)
+        .await
+        .unwrap();
+
+    run(
+        &mut session,
+        &empty_callbacks,
+        r#"
+import sys
+sys._eryx_callback_setup_compiles = 0
+sys._eryx_fail_callback_setup_once = True
+def _eryx_track_callback_setup(event, args, _sys=sys):
+    if event == 'compile':
+        source = args[0]
+        if isinstance(source, str):
+            source = source.encode('utf-8', 'replace')
+        if b'_eryx_callbacks_json' in source:
+            _sys._eryx_callback_setup_compiles += 1
+    elif event == 'exec' and '_eryx_callbacks_json' in args[0].co_names:
+        if _sys._eryx_fail_callback_setup_once:
+            _sys._eryx_fail_callback_setup_once = False
+            raise RuntimeError('fail setup once')
+sys.addaudithook(_eryx_track_callback_setup)
+"#,
+    )
+    .await;
+
+    let error = run_result(&mut session, &callbacks, "print(await echo(data='retry'))")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("fail setup once"), "{error}");
+    assert_eq!(
+        run(&mut session, &callbacks, "print(await echo(data='retry'))").await,
+        b"retry\n"
+    );
+    assert_eq!(
+        run(
+            &mut session,
+            &callbacks,
+            "import sys; print(sys._eryx_callback_setup_compiles, sys._eryx_fail_callback_setup_once)"
+        )
+        .await,
+        b"1 False\n"
     );
 }
 
